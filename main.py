@@ -1,22 +1,21 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional
-import openai
+import anthropic
 import os
 import time
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
-app = FastAPI(title="Kimi Trade Guardian", version="1.0")
+app = FastAPI(title="Claude Trade Guardian", version="1.0")
 
-# Initialize Kimi client
-client = openai.OpenAI(
-    api_key=os.getenv("KIMI_API_KEY"),
-    base_url="https://api.moonshot.cn/v1"
+# Initialize Claude client
+client = anthropic.Anthropic(
+    api_key=os.getenv("ANTHROPIC_API_KEY")
 )
 
 # Database pool for speed
@@ -31,12 +30,12 @@ executor = ThreadPoolExecutor(max_workers=4)
 class TradeSetup(BaseModel):
     trade_id: str
     symbol: str
-    direction: str  # Long or Short
+    direction: str
     entry_price: float
     stop_loss: float
     take_profit: float
-    setup_type: str  # MTF_Fib_618, EMA_Cross, etc.
-    timestamp: str  # ISO format
+    setup_type: str
+    timestamp: str
     account_balance: Optional[float] = 25000.0
     daily_pnl: Optional[float] = 0.0
     vix: Optional[float] = 15.0
@@ -44,14 +43,14 @@ class TradeSetup(BaseModel):
 
 class TradeDecision(BaseModel):
     proceed: bool
-    confidence: int  # 0-100
+    confidence: int
     reason: str
-    size_multiplier: float  # 0.0 to 2.0
+    size_multiplier: float
     suggested_stop: Optional[float] = None
     risk_warning: Optional[str] = None
 
 def get_recent_performance(conn, symbol: str, setup_type: str):
-    """Get last 20 trades for context - optimized query"""
+    """Get last 20 trades for context"""
     cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute("""
         SELECT pnl, win, timestamp, session_time
@@ -73,7 +72,7 @@ def get_recent_performance(conn, symbol: str, setup_type: str):
     return {
         "avg_pnl": sum(r['pnl'] for r in results) / len(results),
         "win_rate": (wins / len(results)) * 100,
-        "recent_trades": results[:5]  # Last 5 only
+        "recent_trades": results[:5]
     }
 
 def check_todays_stats(conn):
@@ -95,23 +94,22 @@ def check_todays_stats(conn):
 async def analyze_trade(setup: TradeSetup):
     """
     Endpoint called by NinjaTrader before every entry.
-    Target response time: <300ms
+    Target response time: <400ms (Claude is slightly slower than Kimi but smarter)
     """
     start_time = time.time()
     
-    # Get DB connection from pool
     conn = db_pool.getconn()
     
     try:
-        # Fetch context data (async in thread pool to not block)
+        # Fetch context data
         loop = asyncio.get_event_loop()
         perf_data = await loop.run_in_executor(
             executor, get_recent_performance, conn, setup.symbol, setup.setup_type
         )
         today_stats = await loop.run_in_executor(executor, check_todays_stats, conn)
         
-        # Build the prompt for Kimi
-        prompt = f"""You are an elite futures risk manager analyzing a trade setup in real-time.
+        # Build the prompt
+        prompt = f"""You are an elite futures risk manager analyzing a trade setup in real-time. Respond ONLY with valid JSON.
 
 TRADE SETUP:
 - Symbol: {setup.symbol}
@@ -133,32 +131,39 @@ RECENT TRADES (Last 5):
 {json.dumps([{'pnl': r['pnl'], 'win': r['win'], 'time': str(r['timestamp'])} for r in perf_data['recent_trades']], indent=2)}
 
 DECISION RULES:
-1. If consecutive_losses >= 2, RECOMMEND HALF SIZE or REJECT
+1. If consecutive_losses >= 2, recommend HALF SIZE or REJECT
 2. If daily_pnl < -1000, REJECT (protect capital)
 3. If win_rate < 35% for this setup, REJECT or require 1:3 R/R
 4. If time is after 14:00 ET and not trend-following, REJECT
 5. If VIX > 20 and stop < 10 ticks, REJECT (volatility too high)
 
-Respond in JSON:
+Return EXACTLY this JSON structure:
 {{
-    "proceed": true/false,
+    "proceed": true or false,
     "confidence": 0-100,
-    "reason": "Brief explanation",
-    "size_multiplier": 0.5/1.0/1.5/2.0,
-    "suggested_stop": null or price,
-    "risk_warning": "Optional warning"
+    "reason": "Brief explanation under 100 chars",
+    "size_multiplier": 0.5, 1.0, 1.5, or 2.0,
+    "suggested_stop": null or float,
+    "risk_warning": "Optional warning text or null"
 }}"""
 
-        # Call Kimi with low latency settings
-        response = client.chat.completions.create(
-            model="kimi-k2",  # Fast model for quick decisions
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,  # Very deterministic
-            max_tokens=200,   # Short response for speed
-            response_format={"type": "json_object"}
+        # Call Claude 3.5 Sonnet (fastest smart model)
+        message = client.messages.create(
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=500,
+            temperature=0.1,
+            messages=[{"role": "user", "content": prompt}]
         )
         
-        decision = json.loads(response.choices[0].message.content)
+        # Parse JSON from response
+        response_text = message.content[0].text
+        # Extract JSON if wrapped in code blocks
+        if "```json" in response_text:
+            response_text = response_text.split("```json")[1].split("```")[0]
+        elif "```" in response_text:
+            response_text = response_text.split("```")[1].split("```")[0]
+            
+        decision = json.loads(response_text.strip())
         
         # Ensure all fields exist
         decision.setdefault('proceed', True)
@@ -166,12 +171,12 @@ Respond in JSON:
         decision.setdefault('reason', 'No specific pattern detected')
         decision.setdefault('size_multiplier', 1.0)
         
-        # Log the decision for learning
+        # Log the decision
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO ai_trade_decisions 
             (trade_id, timestamp, setup_json, decision_json, latency_ms, model_used)
-            VALUES (%s, NOW(), %s, %s, %s, 'kimi-k2')
+            VALUES (%s, NOW(), %s, %s, %s, 'claude-3.5-sonnet')
         """, (
             setup.trade_id,
             json.dumps(setup.dict()),
@@ -186,12 +191,12 @@ Respond in JSON:
         return TradeDecision(**decision)
         
     except Exception as e:
-        print(f"❌ Error analyzing trade: {e}")
-        # Fail open (allow trade) but warn
+        print(f"❌ Error: {e}")
+        # Fail open
         return TradeDecision(
             proceed=True,
             confidence=0,
-            reason=f"AI Error: {str(e)}. Trading without validation.",
+            reason=f"AI Error: {str(e)[:50]}. Trading without validation.",
             size_multiplier=1.0,
             risk_warning="System error - use manual discretion"
         )
@@ -200,9 +205,8 @@ Respond in JSON:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "timestamp": datetime.utcnow()}
+    return {"status": "ok", "model": "claude-3.5-sonnet", "timestamp": datetime.utcnow()}
 
-# Database initialization endpoint (run once)
 @app.post("/init-db")
 def init_database():
     conn = db_pool.getconn()
