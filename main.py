@@ -60,7 +60,7 @@ Return: {{"proceed": bool, "confidence": 0-100, "reason": "text", "size_multipli
 
     try:
         message = client.messages.create(
-            model="claude-3-5-sonnet-20241022",
+            model="claude-3-5-sonnet-latest",
             max_tokens=500,
             temperature=0.1,
             messages=[{"role": "user", "content": prompt}]
