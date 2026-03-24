@@ -1,27 +1,17 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import Optional
 import anthropic
 import os
 import time
-import pg8000
 from datetime import datetime
-import asyncio
-from contextlib import contextmanager
 
 app = FastAPI(title="Claude Trade Guardian", version="1.0")
 
 client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
-# pg8000 connection (pure Python, no libpq needed)
-def get_db_conn():
-    return pg8000.connect(
-        host=os.getenv("DB_HOST"),
-        port=int(os.getenv("DB_PORT", 5432)),
-        database=os.getenv("DB_NAME"),
-        user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASSWORD")
-    )
+# In-memory storage (resets on deploy, but works immediately)
+trade_history = []
 
 class TradeSetup(BaseModel):
     trade_id: str
@@ -43,106 +33,32 @@ class TradeDecision(BaseModel):
     reason: str
     size_multiplier: float
     suggested_stop: Optional[float] = None
-    risk_warning: Optional[str] = None
 
-@app.on_event("startup")
-async def startup():
-    # Test connection and create table
-    conn = get_db_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS ai_trade_decisions (
-            id SERIAL PRIMARY KEY,
-            trade_id VARCHAR(50),
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            setup_json JSONB,
-            decision_json JSONB,
-            latency_ms INTEGER,
-            model_used VARCHAR(20)
-        )
-    """)
-    conn.commit()
-    cur.close()
-    conn.close()
-
-def get_recent_performance(symbol: str, setup_type: str):
-    conn = get_db_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT pnl, win, timestamp, session_time
-        FROM trade_outcomes 
-        WHERE symbol = %s 
-        AND setup_type = %s
-        AND timestamp > NOW() - INTERVAL '30 days'
-        ORDER BY timestamp DESC 
-        LIMIT 20
-    """, (symbol, setup_type))
-    
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    
-    if not rows:
-        return {"avg_pnl": 0, "win_rate": 50, "recent_trades": []}
-    
-    wins = sum(1 for r in rows if r[1])  # win is 2nd column
-    return {
-        "avg_pnl": sum(r[0] for r in rows) / len(rows),
-        "win_rate": (wins / len(rows)) * 100,
-        "recent_trades": rows[:5]
-    }
-
-def check_todays_stats():
-    conn = get_db_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT 
-            SUM(pnl) as daily_pnl,
-            COUNT(*) as trade_count,
-            SUM(CASE WHEN win THEN 1 ELSE 0 END) as wins
-        FROM trade_outcomes 
-        WHERE DATE(timestamp) = CURRENT_DATE
-    """)
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
-    return row or (0, 0, 0)
-
-@app.post("/analyze-trade", response_model=TradeDecision)
+@app.post("/analyze-trade")
 async def analyze_trade(setup: TradeSetup):
     start_time = time.time()
     
-    try:
-        # Get data (run in thread to not block)
-        loop = asyncio.get_event_loop()
-        perf_data = await loop.run_in_executor(None, get_recent_performance, setup.symbol, setup.setup_type)
-        today_stats = await loop.run_in_executor(None, check_todays_stats)
-        
-        time_str = "Unknown"
-        if 'T' in setup.timestamp:
-            dt = datetime.fromisoformat(setup.timestamp.replace('Z', '+00:00'))
-            time_str = dt.strftime('%H:%M')
-        
-        prompt = f"""You are an elite futures risk manager. Respond with JSON only.
+    # Simple in-memory analysis (no DB needed)
+    recent_trades = [t for t in trade_history if t['symbol'] == setup.symbol][-20:]
+    win_rate = 50
+    if recent_trades:
+        wins = sum(1 for t in recent_trades if t.get('win', False))
+        win_rate = (wins / len(recent_trades)) * 100
+    
+    prompt = f"""You are an elite futures risk manager. JSON only.
 
-TRADE:
-- Symbol: {setup.symbol}, Direction: {setup.direction}
-- Entry: {setup.entry_price}, Stop: {setup.stop_loss}, Target: {setup.take_profit}
-- R:R: 1:{abs((setup.take_profit - setup.entry_price) / (setup.entry_price - setup.stop_loss)):.1f}
-- Time: {time_str}, VIX: {setup.vix}
-- Consecutive Losses: {setup.consecutive_losses}
-
-HISTORY:
-- Setup win rate: {perf_data['win_rate']:.1f}%
-- Today's PnL: ${today_stats[0] or 0:.2f}
+TRADE: {setup.symbol} {setup.direction} @ {setup.entry_price}
+VIX: {setup.vix} | Consecutive Losses: {setup.consecutive_losses}
+Win Rate (20 samples): {win_rate:.1f}%
 
 RULES:
-1. If consecutive_losses >= 2, BLOCK or HALF SIZE
-2. If daily_pnl < -1000, BLOCK
-3. If win_rate < 35%, BLOCK
+1. If consecutive_losses >= 2 → BLOCK or 0.5x size
+2. If daily_pnl < -1000 → BLOCK
+3. If win_rate < 35% → BLOCK
 
-Return: {{"proceed": bool, "confidence": 0-100, "reason": "text", "size_multiplier": 0.5/1.0/1.5/2.0, "suggested_stop": null or float}}"""
+Return: {{"proceed": bool, "confidence": 0-100, "reason": "text", "size_multiplier": 0.5/1.0/1.5/2.0, "suggested_stop": null}}"""
 
+    try:
         message = client.messages.create(
             model="claude-3-5-sonnet-20241022",
             max_tokens=500,
@@ -159,30 +75,22 @@ Return: {{"proceed": bool, "confidence": 0-100, "reason": "text", "size_multipli
         import json
         decision = json.loads(response_text.strip())
         
-        # Ensure fields
         decision.setdefault('proceed', True)
         decision.setdefault('confidence', 50)
         decision.setdefault('reason', 'No pattern')
         decision.setdefault('size_multiplier', 1.0)
         
-        # Log to DB
-        conn = get_db_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO ai_trade_decisions (trade_id, setup_json, decision_json, latency_ms, model_used)
-            VALUES (%s, %s, %s, %s, 'claude-3.5-sonnet')
-        """, (
-            setup.trade_id,
-            json.dumps(setup.dict()),
-            json.dumps(decision),
-            int((time.time() - start_time) * 1000)
-        ))
-        conn.commit()
-        cur.close()
-        conn.close()
+        # Store in memory
+        trade_history.append({
+            'trade_id': setup.trade_id,
+            'symbol': setup.symbol,
+            'direction': setup.direction,
+            'timestamp': datetime.utcnow().isoformat(),
+            'decision': decision
+        })
         
         latency = int((time.time() - start_time) * 1000)
-        print(f"✅ {setup.trade_id}: {'APPROVED' if decision['proceed'] else 'BLOCKED'} ({decision['confidence']}%) in {latency}ms")
+        print(f"✅ {setup.trade_id}: {'APPROVED' if decision['proceed'] else 'BLOCKED'} in {latency}ms")
         
         return TradeDecision(**decision)
         
@@ -192,7 +100,7 @@ Return: {{"proceed": bool, "confidence": 0-100, "reason": "text", "size_multipli
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+    return {"status": "ok", "trades_stored": len(trade_history), "timestamp": datetime.utcnow().isoformat()}
 
 if __name__ == "__main__":
     import uvicorn
