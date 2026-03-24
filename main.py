@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import Optional
-import openai  # Change this
+import openai
 import os
 import time
 import json
@@ -9,7 +9,6 @@ from datetime import datetime
 
 app = FastAPI(title="Trade Guardian", version="1.0")
 
-# Use OpenAI instead
 client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 trade_history = []
@@ -82,3 +81,16 @@ Return JSON: {{"proceed": bool, "confidence": 0-100, "reason": "text", "size_mul
         latency = int((time.time() - start_time) * 1000)
         print(f"✅ {setup.trade_id}: {'APPROVED' if decision['proceed'] else 'BLOCKED'} in {latency}ms")
         
+        return TradeDecision(**decision)
+        
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        return TradeDecision(proceed=True, confidence=0, reason=str(e)[:50], size_multiplier=1.0)
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "trades_stored": len(trade_history)}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
